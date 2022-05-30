@@ -32,13 +32,35 @@ def preprocess(g, num_rels):
 
     return train_g, test_g
 
+class GlobalUniform_forTriples:
+    def __init__(self, g, sample_size, p_edges_num):
+        self.sample_size = sample_size
+        self.eids = np.arange(p_edges_num)
+
+    def sample(self, return_removed = False):
+        kept_edges = th.from_numpy(np.random.choice(self.eids, int(self.sample_size)))
+        
+        if(return_removed == True):
+            removed_edges = list(set(self.eids) - set(kept_edges.numpy()))
+            return kept_edges, th.tensor(removed_edges)
+        
+        return kept_edges
+
 class GlobalUniform:
     def __init__(self, g, sample_size):
         self.sample_size = sample_size
         self.eids = np.arange(g.num_edges())
 
-    def sample(self):
-        return th.from_numpy(np.random.choice(self.eids, self.sample_size))
+    def sample(self, return_removed = True):
+        kept_edges = th.from_numpy(np.random.choice(self.eids, self.sample_size))
+        
+        if(return_removed == True):
+            removed_edges = list(set(th.tensor(self.eids)) - set(kept_edges))
+            removed_edges = th.tensor(removed_edges)
+
+            return kept_edges, removed_edges
+        
+        return kept_edges
 
 class NeighborExpand:
     def __init__(self, g, sample_size):
@@ -188,8 +210,8 @@ class IncGraphMaker:
         # self.neg_sampler = NegativeSampler()
 
     def get_inc_graph(self, has_etype=True):
-        eids = self.pos_sampler.sample()
-        src, dst = self.g.find_edges(eids)
+        eids, removed_eids = self.pos_sampler.sample()
+        src, dst = self.g.find_edges(eids.numpy())
         src, dst = src.numpy(), dst.numpy()
         rel = None
         if has_etype == True:
@@ -199,8 +221,16 @@ class IncGraphMaker:
 
         return inc_g,rel
 
+def makeGraphFromEids(g, eids):
+        src, dst = g.find_edges(eids)
+        src, dst = src.numpy(), dst.numpy()
+        rel = None
+        if has_etype == True:
+            rel = self.g.edata['etype'][eids].numpy()
 
+        inc_g = dgl.graph((src, dst), num_nodes = self.g.num_nodes())
 
+        return inc_g,rel
 
 
 class SubgraphIterator:
@@ -680,6 +710,101 @@ class TestDataset(Dataset):
             y[e2] = 1.0
         return torch.FloatTensor(y)
 
+class createTriplesDataset(Dataset):
+    def __init__(self, g, p_edges_num, unknown_id, lbl_smooth, num_workers, batch_size, device):
+        self.g = g
+        self.p_edges_num = p_edges_num
+        self.sample_size = 0.7 * p_edges_num
+        self.pos_sampler = GlobalUniform_forTriples(self.g, self.sample_size, p_edges_num)
+        self.lbl_smooth = lbl_smooth
+        self.num_workers = num_workers
+        self.batch_size = batch_size
+        self.num_rels = max(self.g.edata['etype']) + 1
+        self.num_rels = unknown_id + 1
+
+        eids, normal_eids = self.pos_sampler.sample(return_removed=True)
+        eids = eids.to(device)
+        normal_eids = normal_eids.to(device)
+        # pos_rels = g.edata['etype'][eids]
+        g.edata['etype'][eids] = unknown_id
+
+        src, dst = g.find_edges(eids)
+        # src, dst = src.numpy(), dst.numpy()
+        # src_trip = src[th.where(g.edata['etype'][eids]==unknown_id)]
+        # dst_trip = dst[th.where(g.edata['etype'][eids]==unknown_id)]
+        # in_edges_mask = [True] * (self.g.num_edges()//2) + [False] * (self.g.num_edges()//2)
+        # out_edges_mask = [False] * (self.g.num_edges()//2) + [True] * (self.g.num_edges()//2)
+        # self.g.edata['in_edges_mask'] = torch.Tensor(in_edges_mask)
+        # self.g.edata['out_edges_mask'] = torch.Tensor(out_edges_mask)
+        
+        #Opti
+        self.triples = []
+        for idx, e in enumerate(eids):
+            self.triples.append({'triple':(src[idx], unknown_id, dst[idx]), 'label': g.edata['etype'][e].cpu().numpy(), 'ground_truth': th.tensor(1)})
+
+        # put in negatives
+        neg_eids = np.arange(p_edges_num, self.g.num_edges())
+        src, dst = g.find_edges(neg_eids)
+        for idx, e in enumerate(zip(src, dst)):
+            self.triples.append({'triple':(e[0], unknown_id, e[1]), 'label': unknown_id, 'ground_truth': th.tensor(2)})
+        
+        src, dst = g.find_edges(normal_eids)
+        for idx, e in enumerate(zip(src, dst, normal_eids)):
+            self.triples.append({'triple':(e[0], g.edata['etype'][e[2]], e[1]), 'label': g.edata['etype'][e[2]].cpu().numpy(), 'ground_truth': th.tensor(0)})
+
+
+
+    def __len__(self):
+        return len(self.triples)
+
+    def __getitem__(self, idx):
+        ele = self.triples[idx]
+        triple, label, gt = torch.LongTensor(ele['triple']), np.int32(ele['label']), ele['ground_truth']
+        trp_label = self.get_label(label)
+        #label smoothing
+        if self.lbl_smooth != 0.0:
+            trp_label = (1.0 - self.lbl_smooth) * trp_label + (1.0 / self.g.num_nodes())
+
+        return triple, trp_label, gt
+    
+    @staticmethod
+    def collate_fn(data):
+        triples = []
+        labels = []
+        gts = []
+        negatives = []
+        positives = []
+        i = 0
+        for triple, label, gt in data:
+            triples.append(triple)
+            labels.append(label)
+            gts.append(gt)
+            if gt == 2:
+                negatives.append(i)
+            elif gt == 1:
+                positives.append(i)
+            i+=1
+
+        triple = torch.stack(triples, dim=0)
+        trp_label = torch.stack(labels, dim=0)
+        gts = torch.stack(gts, dim=0)
+        negatives = th.tensor(negatives)
+        positives = th.tensor(positives) 
+        return triple, trp_label, gts, negatives, positives
+        
+    #for edges that exist in the graph, the entry is 1.0, otherwise the entry is 0.0
+    def get_label(self, label):
+        y = np.zeros([self.num_rels], dtype=np.float32)
+        y[label] = 1.0
+        return torch.FloatTensor(y)
+
+
+
+    
+
+    # dataset, lbl_smooth, num_workers, batch_size, iep, edge_sampler):
+    
+
 
 class Data(object):
 
@@ -765,13 +890,10 @@ class Data(object):
         self.g = dgl.graph((src, dst), num_nodes=self.num_ent)
         self.g.edata['etype'] = torch.Tensor(rels).long()
         self.inc = IncGraphMaker(self.iep, self.g, self.edge_sampler, lbl_smooth, num_workers, self.edge_sampler)
-        self.inc_g_wo_rel, inc_rel = self.inc.get_inc_graph()
-        
+        self.inc_g_wo_rel, self.inc_rel = self.inc.get_inc_graph()        
 
         self.inc_g_w_rel = copy.deepcopy(self.inc_g_wo_rel)
-        self.inc_g_w_rel.edata['etype'] = torch.Tensor(inc_rel).long()            
-
-        
+        self.inc_g_w_rel.edata['etype'] = torch.Tensor(self.inc_rel).long()            
 
         #identify in and out edges
         in_edges_mask = [True] * (self.g.num_edges()//2) + [False] * (self.g.num_edges()//2)

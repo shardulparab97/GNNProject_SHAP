@@ -53,7 +53,7 @@ class CompGraphConv(nn.Module):
         
         if self.num_bases < self.num_rels:
             # linear combination coefficients in equation (3)
-            self.w_comp = nn.Parameter(th.Tensor(self.num_rels, self.num_bases))
+            self.w_comp = nn.Parameter(th.Tensor(self.num_rels + 1, self.num_bases))
             nn.init.xavier_normal_(self.w_comp)
 
         # self.relation_pri   = nn.Parameter(th.ones(num_relations, self.n_heads))
@@ -106,7 +106,7 @@ class CompGraphConv(nn.Module):
             g.edata['h'] = r_feats[g.edata['etype']] * g.edata['norm']
 
             coefficient = self.w_comp  # 50
-            self.relations_weights = th.matmul(coefficient, self.relation_att.view(self.num_bases, -1))
+            self.relations_weights = th.matmul(coefficient, self.relation_att.view(self.num_bases, -1)) # num_relations x 200
 
             g.apply_edges(func=self.edge_attention)
 
@@ -171,12 +171,12 @@ class CompGCN(nn.Module):
         
         if self.num_bases > 0:
             self.basis = nn.Parameter(th.Tensor(self.num_bases, self.in_dim))
-            self.weights = nn.Parameter(th.Tensor(self.num_rel, self.num_bases))
+            self.weights = nn.Parameter(th.Tensor(self.num_rel + 1, self.num_bases)) # 1 UNK relation
             nn.init.xavier_normal_(self.basis)
             nn.init.xavier_normal_(self.weights)
         
         else:
-            self.rel_embds = nn.Parameter(th.Tensor(self.num_rel, self.in_dim))
+            self.rel_embds = nn.Parameter(th.Tensor(self.num_rel + 1, self.in_dim))
             nn.init.xavier_normal_(self.rel_embds)
 
         self.n_embds = nn.Parameter(th.Tensor(self.num_ent, self.in_dim))
@@ -269,6 +269,7 @@ class CompGCN_ConvE(nn.Module):
     def forward(self, graph, sub, rel, obj):
         #get sub_emb and rel_emb via compGCN
         n_feats, r_feats = self.compGCN_Model(graph)
+        r_feats = r_feats[:-1]
         sub_emb = n_feats[sub, :]
         # rel_emb = r_feats[rel, :]
         obj_emb = n_feats[obj, :]
@@ -292,5 +293,5 @@ class CompGCN_ConvE(nn.Module):
         #add in bias
         x += self.bias.expand_as(x)
         score = th.sigmoid(x)
-        return score, 
+        return score
         

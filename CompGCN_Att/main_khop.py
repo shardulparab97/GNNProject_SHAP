@@ -3,15 +3,18 @@ import torch as th
 import torch.optim as optim
 import torch.nn.functional as F
 import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+
 
 import dgl.function as fn
 from dgl.dataloading import GraphDataLoader
+import copy
+import dgl
 
+from utils import in_out_norm, inc_in_out_norm
 
-from utils import in_out_norm
-
-from models_hgt_subgraph import CompGCN_ConvE
-from data_loader_subgraph import Data, SubgraphIterator, IncGraphMaker
+from models_hgt_relation_prediction import CompGCN_ConvE
+from data_loader_subgraph import Data, SubgraphIterator, IncGraphMaker, GlobalUniform, makeGraphFromEids, createTriplesDataset
 import numpy as np
 from time import time
 import os
@@ -19,7 +22,7 @@ from dgl import KHopGraph
 
 
 import debugpy
-debugpy.listen(5590)
+debugpy.listen(5950)
 print("Waiting for debugger")
 debugpy.wait_for_client()
 print("Attached! :)")
@@ -34,7 +37,7 @@ def predict(model, graph, device, data_iter, split='valid', mode='tail'):
         for step, batch in enumerate(train_iter):
             triple, label = batch[0].to(device), batch[1].to(device)
             sub, rel, obj, label = triple[:, 0], triple[:, 1], triple[:, 2], label
-            pred = model(graph, sub, rel)
+            pred = model(graph, sub, rel, obj)
             b_range = th.arange(pred.size()[0], device = device)
             target_pred = pred[b_range, obj]
             pred = th.where(label.byte(), -th.ones_like(pred) * 10000000, pred)
@@ -87,6 +90,9 @@ def main(args):
     # rel = th.from_numpy(np.load("transe_embed/FB15k_TransE_l1_relation.npy")).to(device)
     
     #construct graph, split in/out edges and prepare train/validation/test data_loader
+    # This is the starting graph
+
+    # 100% main graph --> data.g
     data = Data(args.dataset, args.lbl_smooth, args.num_workers, args.batch_size, args.iep, args.edge_sampler)
     data_iter = data.data_iter #train/validation/test data_loader
     #graph = data.gem.to(device)
@@ -94,26 +100,36 @@ def main(args):
     # data.inc_g_w_rel = data.inc_g_w_rel.to(device)
     
     # Creating K Hop edges
-    transform = KHopGraph(3)
-    khop_graph = transform(data.inc_g_wo_rel)
-    khop_graph_masked, _ = IncGraphMaker(iep=0.3, g=khop_graph, pos_sampler='uniform', lbl_smooth=args.lbl_smooth, num_workers=args.num_workers).get_inc_graph(has_etype=False)
-    num_rel_khop = th.max(data.g.edata['etype']).item() + 1
-    khop_graph_masked.edata["etype"] = torch.Tensor([num_rel_khop]*khop_graph_masked.num_edges()).long()
+    # transform = KHopGraph(3)
+    # khop_graph = transform(data.inc_g_wo_rel)
 
+    #common after graph addition
+    # khop_iep = min((0.7 * khop_mf * data.inc_g_wo_rel.num_edges()) / khop_graph.num_edges(), 1)
+    # khop_graph_masked, _ = IncGraphMaker(iep=khop_iep, g=khop_graph, pos_sampler='uniform', lbl_smooth=args.lbl_smooth, num_workers=args.num_workers).get_inc_graph(has_etype=False)
+    # num_rel_khop = th.max(data.g.edata['etype']).item() + 1
+    # khop_graph_masked.edata["etype"] = torch.Tensor([num_rel_khop]*khop_graph_masked.num_edges()).long()
 
-    merged_graph = dgl.merge([khop_graph_masked, data.inc_g_w_rel])
-    num_rel = th.max(graph.edata['etype']).item() + 1
+    # merged_graph = dgl.merge([data.inc_g_w_rel, khop_graph_masked])
+    # add edge data in merged graph
+
+    # mg_inc_ids, mg_inc_masked_ids = GlobalUniform(data.inc_g_w_rel, sample_size = 0.3 * data.inc_g_w_rel.num_edges()).sample(return_removed=True)
+    # mg_inc_g = makeGraphFromEids(data.inc_g_wmg_rel, mg_inc_ids)
+
+    # mg_khop_ids, mg_khop_ids_masked = GlobalUniform(khop_graph_masked, sample_size = 0.3 * khop_graph_masked.num_edges()).sample(return_removed=True)
+    # mg_khop_g = makeGraphFromEids(khop_graph_masked, mg_khop_ids)
+    # merged_graph = dgl.merge([mg_inc_g, mg_khop_g])
+
+    #merged_graph = dgl.merge([khop_graph_masked, data.inc_g_w_rel])
+    #num_rel = th.max(graph.edata['etype']).item() + 1
+
+    # merged_graph_masked = IncGraphMaker(iep=0.3, g=khop_graph, pos_sampler='uniform', lbl_smooth=args.lbl_smooth, num_workers=args.num_workers).get_inc_graph(has_etype=False)
+    
 
     # now we have a full graph, but we also want a graph with edge mask
     # full graph will be g and graph with edge mask will be gem
     # Shardul change - push to dgl subgraph only after proper subiteration
     #graph = data.g.to(device)
 
-    import stays
-    sys.exit()
-
-    subg_iter = SubgraphIterator(data, args.edge_sampler, args.lbl_smooth, args.num_workers)
-    train_dataloader = GraphDataLoader(subg_iter, batch_size=1, collate_fn=lambda x: x[0])
 
     # num relations stays the same
     # Shardul change
@@ -144,10 +160,13 @@ def main(args):
                                 emb=None,
                                 rel=None
                                 )
+
+    # Shardul change - should be on device
     compgcn_model = compgcn_model.to(device)
 
     # Step 3: Create training components ===================================================== #
-    loss_fn = th.nn.BCELoss()
+    loss_fn = th.nn.CrossEntropyLoss()
+    loss_fn2 = th.nn.BCELoss()
     if args.optim == 'AdamW':
         print("Using AdamW as optimizer")
         optimizer = optim.AdamW(compgcn_model.parameters())
@@ -165,41 +184,100 @@ def main(args):
     
     os.makedirs(f"checkpoints/{args.run_name}", exist_ok=True)
 
+    # init_g = data.inc_g_wo_rel
+    init_g_with_rel = data.inc_g_w_rel
+    gamma = 0.8
+    k = 2
 
     for epoch in range(args.max_epochs):
+        if (epoch % args.add_after_epoch == 0):
+             # Creating K Hop edges
+            init_g = copy.deepcopy(init_g_with_rel)
+            init_g.edata['etype'] = th.tensor([0] * init_g_with_rel.num_edges()).long()
+            transform = KHopGraph(3)
+            khop_graph = transform(init_g)
+
+            #common after graph addition
+            khop_iep = min((0.7 * args.khop_mf * init_g.num_edges()) / khop_graph.num_edges(), 1)
+            khop_graph_masked, _ = IncGraphMaker(iep=khop_iep, g=khop_graph, pos_sampler='uniform', lbl_smooth=args.lbl_smooth, num_workers=args.num_workers).get_inc_graph(has_etype=False)
+            num_rel_khop = num_rel
+            khop_graph_masked.edata["etype"] = th.Tensor([num_rel_khop] * khop_graph_masked.num_edges()).long()
+
+            merged_graph = dgl.merge([init_g_with_rel, khop_graph_masked])
+            merged_graph = merged_graph.to(device)
+            merged_graph = inc_in_out_norm(merged_graph)
+
+            dataset = createTriplesDataset(merged_graph, init_g_with_rel.num_edges(), num_rel_khop, args.lbl_smooth, args.num_workers, args.batch_size, device)
+
+            train_iter =   DataLoader(dataset, batch_size=args.batch_size, shuffle=True,collate_fn=dataset.collate_fn)
+
+        # now run loop for training    
         # Training and validation using a full graph
         compgcn_model.train()
         train_loss=[]
         t0 = time()
 
-        # no worries here since batch size is 1
-        for step_main, batch_main in enumerate(train_dataloader):
-            sub_g, uniq_v, num_nodes, subgraph_data_iter, global_ids = batch_main
-            # pushing graph on to device
-            global_ids = th.tensor(global_ids).to(device)
-            sub_g = sub_g.to(device)
-            sub_g = in_out_norm(sub_g)
-            #uniq_v = uniq_v.to(device)
 
-            # looping over train data_loader for this graph
-            for step, batch in enumerate(subgraph_data_iter['train']):
-                triple, label = batch[0].to(device), batch[1].to(device)
-                sub, rel, obj, label = triple[:, 0], triple[:, 1], triple[:, 2], label
-                logits = compgcn_model(sub_g, sub, rel, global_ids)
-                 # compute loss
-                tr_loss = loss_fn(logits, label)
-                train_loss.append(tr_loss.item())
+        # for step, batch in enumerate(train_iter):
 
 
+        # # no worries here since batch size is 1
+        # for step_main, batch_main in enumerate(train_dataloader):
+        #     sub_g, uniq_v, num_nodes, subgraph_data_iter, global_ids = batch_main
+        #     # pushing graph on to device
+        #     global_ids = th.tensor(global_ids).to(device)
+        #     sub_g = sub_g.to(device)
+        #     sub_g = in_out_norm(sub_g)
+        #     #uniq_v = uniq_v.to(device)
 
-        for step, batch in enumerate(data_iter['train']):
-            triple, label = batch[0].to(device), batch[1].to(device)
+        #     # looping over train data_loader for this graph
+        #     for step, batch in enumerate(subgraph_data_iter['train']):
+        #         triple, label = batch[0].to(device), batch[1].to(device)
+        #         sub, rel, obj, label = triple[:, 0], triple[:, 1], triple[:, 2], label
+        #         logits = compgcn_model(sub_g, sub, rel, global_ids)
+        #          # compute loss
+        #         tr_loss = loss_fn(logits, label)
+        #         train_loss.append(tr_loss.item())
+
+        merged_graph = merged_graph.to(device)
+        top_k = []
+        for step, batch in enumerate(train_iter):
+            triple, label, gt, neg_indices, pos_indices = batch[0].to(device), batch[1].to(device), batch[2], batch[3].to(device), batch[4].to(device) # bs x 3, bs x num_rels + 1, 
             sub, rel, obj, label = triple[:, 0], triple[:, 1], triple[:, 2], label
-            logits = compgcn_model(graph, sub, rel) # shape is 1024, 14541
-		
+
+
+            # logits = compgcn_model(merged_graph, sub, rel) # shape is 1024, 14541
+            # negatives = gt[gt=="negative"]
+            # positives = gt[gt=="positive"]
+            logits = compgcn_model(merged_graph, sub, rel, obj)
+
+
+            #####################################
+
             # compute loss
-            tr_loss = loss_fn(logits, label)
+            tr_pos_loss = loss_fn(logits[pos_indices], label[pos_indices][:,:-1])  # classification loss
+
+            # tr_pos_exist_loss = th.nn.Functional.Sigmoid(node_features[sub[pos_indices]] @ node_features[obj[pos_indices]])
+            # tr_neg_exist_loss = -1 * th.sum(node_features[sub[pos_indices]] * node_features[obj[pos_indices]], dim=1)
+            # tr_neg_loss = loss_fn(logits[neg_indices], label[neg_indices])
+
+            logits_relation = th.max(logits, dim=1).indices
+            logits_confidence = th.max(logits, dim=1).values
+
+            neg_labels = th.zeros(neg_indices.shape).to(device)
+            loss2 = loss_fn2(logits_confidence[neg_indices], neg_labels)
+
+            tr_loss = gamma * tr_pos_loss + (1-gamma) * loss2
+
             train_loss.append(tr_loss.item())
+
+            top_k.extend(sorted(zip(logits_confidence[neg_indices], logits_relation[neg_indices], sub[neg_indices], obj[neg_indices]), reverse=True)[:k])
+
+
+
+
+
+            ######################################
 
             # backward
             optimizer.zero_grad()
@@ -211,15 +289,21 @@ def main(args):
                 scheduler.step(train_step)
                 # print("Train Step:", train_step)
         
-        # if epoch == 1:
-        #     file1 = open("steps_number.txt", "w") 
-        #     str1 = str(steps_per_epoch)
-        #     file1.write("Steps per epoch = " + str1 + "\n")
-        #     file1.close()
-            
+        if (epoch % args.add_after_epoch == 0):
+            augment_edges = sorted(top_k, reverse=True)[:k]
+            _, relations, sources, destinations = zip(*augment_edges)
+            relations = th.tensor(relations)
+            sources = th.tensor(sources)
+            destinations = th.tensor(destinations)
+            print(relations)
+
+            init_g_with_rel.add_edges(sources, destinations)
+            init_g_with_rel.edata['etype'][th.arange(len(init_g_with_rel.edata['etype']) - k, len(init_g_with_rel.edata['etype']))]  = relations
 
         train_loss = np.sum(train_loss)
 
+        print(train_loss)
+        continue
         t1 = time()  
         val_results = evaluate(compgcn_model, graph, device, data_iter, split='valid')
         t2 = time()
@@ -290,13 +374,15 @@ if __name__ == '__main__':
     parser.add_argument('--sched', dest='sched', default='', help='Scheduler name')
     
     # Parameters for graph sampling
-    parser.add_argument("--edge-sampler", dest='edge_sampler', type=str, default='neighbor',
+    parser.add_argument("--edge-sampler", dest='edge_sampler', type=str, default='uniform',
                         choices=['uniform', 'neighbor'],
                         help="Type of edge sampler: 'uniform' or 'neighbor'"
                              "The original implementation uses neighbor sampler.")
 
     parser.add_argument("--initial_edge_percentage", dest='iep', type=float, default='0.1')
     parser.add_argument("--k_hop_list", nargs='?', default='[1, 2, 3]', dest='khl')
+    parser.add_argument("--add_after_epoch", type=int, default=2, dest='add_after_epoch')
+    parser.add_argument("--khop_mf", type=float, default=10, dest='khop_mf')
 
 
     args = parser.parse_args()
