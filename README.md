@@ -1,7 +1,8 @@
 # GNNProject_SHAP
 
 Everything lies inside CompGCN+ATT folder.
-The zip of datasets are also inside the folder.
+
+The dataset can be downloaded using the .sh files available.
 
 Requirements:
 torch
